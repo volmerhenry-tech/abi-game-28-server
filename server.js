@@ -746,6 +746,8 @@ wss.on('connection', (ws, req) => {
   perIp.set(ip, (perIp.get(ip) || 0) + 1);
   ws.on('close', () => { const left = (perIp.get(ip) || 1) - 1; if (left <= 0) perIp.delete(ip); else perIp.set(ip, left); });
   const client = new Client(ws);
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (data) => {
     let m;
     try { m = JSON.parse(data.toString()); } catch { return; }
@@ -759,6 +761,15 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
 });
 
+// Verbindungs-Check: alle 15 s ein Ping; wer nicht antwortet, wird entfernt (Handy ohne Netz, Tab eingefroren). Hält auch Leitungen offen.
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) { ws.terminate(); continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch { /* Verbindung schon weg */ }
+  }
+}, 15000);
+
 setInterval(() => { for (const room of [...rooms.values()]) { try { room.tick(); } catch (error) { log('Tick-Fehler', error); } } }, 100);
 
 server.listen(PORT, () => log(`Server läuft auf Port ${PORT}`));
@@ -770,3 +781,5 @@ process.on('SIGTERM', () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 });
+
+
