@@ -9,6 +9,8 @@ const WebSocket = require('ws');
 
 const PORT = Number(process.env.PORT) || 8787;
 const SLOT_COUNT = 10;
+const BOT_RESERVE_SLOTS = 2;   // so viele Plätze bleiben für Menschen frei (wie im Spiel)
+const BOT_PREFIX = 'bot_';
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
 // Enum-Werte wie im Spiel (Models.cs)
@@ -19,7 +21,7 @@ const Phase = { Waiting: 0, Countdown: 1, MapDecided: 2, LoadingRace: 3, InRace:
 const DEFAULTS = {
   lobbyTimerSeconds: 60, autoStartMinHumans: 3, publicAutoStartMinHumans: 2, lateJoinMinSeconds: 10,
   countdownSeconds: 5, raceLoadTimeoutSeconds: 30, resultsReturnSeconds: 10, finishTimeoutSeconds: 30,
-  kickBanSeconds: 300, publicLaps: 3, coinsByPlace: [50, 40, 32, 26, 22, 18, 15, 12, 10, 8],
+  kickBanSeconds: 300, publicLaps: 3, crownCoins: 10, privateCrownMinHumans: 3,
   maxStateRate: 30, raceCountdownSeconds: 3, sceneReadyTimeoutSeconds: 25
 };
 
@@ -54,7 +56,9 @@ class Room {
     this.modeId = settings.modeId || 'race';
     this.maxPlayers = Math.max(2, Math.min(SLOT_COUNT, settings.maxPlayers || SLOT_COUNT));
     this.laps = Math.max(1, Math.min(5, settings.laps || 3));
-    this.botsEnabled = false;   // Bots kommen später (der Server füllt sie dann auf)
+    this.botLevel = Math.max(0, Math.min(3, settings.botLevel | 0));   // 0 aus, 1 leicht, 2 schwer, 3 ultra (Bots selbst kommen online später)
+    this.botsEnabled = this.botLevel > 0;
+    this.botPool = [];   // Namen und Autos für die Bots (schickt das Spiel)
     this.phase = Phase.Waiting;
     this.lobbyEndTime = 0;
     this.countdownEndTime = 0;
@@ -76,12 +80,49 @@ class Room {
   emptySlot(index, locked) {
     return {
       index, type: locked ? SlotType.Locked : SlotType.Empty, playerId: '', displayName: '', ready: false,
-      connected: true, returning: false, car: { carId: '', paintId: 'blue', patternId: 'none', materialId: 'lacquer', hornId: 'horn_2', stickers: ['', '', '', ''] },
+      connected: true, returning: false, car: { carId: '', paintId: 'blue', patternId: 'none', materialId: 'lacquer', hornId: 'horn_2', teacherId: 'teacher_1', teacherSkinId: '', stickers: ['', '', '', ''] },
       voteMapId: ''
     };
   }
 
   humans() { return this.slots.filter((s) => s.type === SlotType.Human); }
+  bots() { return this.slots.filter((s) => s.type === SlotType.Bot); }
+
+  setBotPool(pool) {
+    if (!Array.isArray(pool)) return;
+    this.botPool = pool.slice(0, 12).map((e) => ({ name: sanitizeName(e && e.name), car: sanitizeCar(e && e.car) })).filter((e) => e.car);
+  }
+
+  // Wie im Spiel: freie Plätze hinter dem letzten Menschen mit Bots füllen, zwei Plätze bleiben frei
+  rebalanceBots() {
+    if (this.phase !== Phase.Waiting) return;
+    const humans = this.humans().length;
+    const desired = this.botLevel > 0 ? Math.max(0, this.maxPlayers - BOT_RESERVE_SLOTS - humans) : 0;
+    const bots = this.bots();
+    for (let i = bots.length - 1; i >= desired; i--) Object.assign(bots[i], this.emptySlot(bots[i].index, false));
+    let lastHuman = -1;
+    this.slots.forEach((slot, i) => { if (slot.type === SlotType.Human) lastHuman = i; });
+    let count = Math.min(bots.length, desired);
+    for (let i = lastHuman + 1; i < this.maxPlayers && count < desired; i++) {
+      const slot = this.slots[i];
+      if (slot.type !== SlotType.Empty) continue;
+      slot.type = SlotType.Bot;
+      slot.playerId = BOT_PREFIX + i;
+      slot.ready = true;
+      count++;
+    }
+    this.bots().forEach((slot, k) => {
+      const entry = this.botPool.length ? this.botPool[k % this.botPool.length] : null;
+      slot.displayName = entry ? entry.name : 'Bot ' + (k + 1);
+      if (entry) slot.car = entry.car;
+      slot.ready = true;
+    });
+  }
+
+  slotById(id) {
+    if (typeof id === 'string' && id.startsWith(BOT_PREFIX)) return this.slots[Number(id.slice(BOT_PREFIX.length))];
+    return this.slotOf(id);
+  }
   slotOf(playerId) { return this.slots.find((s) => s.type === SlotType.Human && s.playerId === playerId); }
   isHost(playerId) { return !this.isPublic && this.hostPlayerId === playerId; }
   minHumans() { return this.isPublic ? this.cfg.publicAutoStartMinHumans : this.cfg.autoStartMinHumans; }
@@ -106,6 +147,7 @@ class Room {
     if (car) target.car = car;
     this.clients.set(client.playerId, client);
     client.room = this;
+    this.rebalanceBots();
     return target;
   }
 
@@ -123,6 +165,7 @@ class Room {
       this.hostPlayerId = this.humans()[0].playerId;
       this.notice('Der Gastgeber hat den Raum verlassen. Neuer Gastgeber: ' + this.humans()[0].displayName);
     }
+    this.rebalanceBots();
     this.afterPlayerLeft(playerId);
     this.broadcastLobby();
     log(`Raum ${this.code}: ${playerId} weg (${reason || 'verlassen'}), ${this.humans().length} übrig`);
@@ -130,6 +173,10 @@ class Room {
 
   afterPlayerLeft(playerId) {
     if (this.phase === Phase.InRace && this.race) {
+      if (this.race.botHost === playerId) {
+        this.race.botHost = '';
+        this.broadcast({ t: 'bots_gone' });   // die Bot-Autos bleiben nicht als Hindernisse stehen
+      }
       delete this.race.progress[playerId];
       this.tryFinishRace();
       this.broadcastStandings();
@@ -156,6 +203,7 @@ class Room {
       maxPlayers: this.maxPlayers,
       laps: this.laps,
       botsEnabled: this.botsEnabled,
+      botLevel: this.botLevel,
       phase: this.phase,
       lobbyEndTime: this.lobbyEndTime,
       countdownEndTime: this.countdownEndTime,
@@ -222,7 +270,8 @@ class Room {
     this.results = new Map();
     this.leftFinished = new Map();
     this.finishDeadline = 0;
-    for (const s of this.slots) { s.voteMapId = ''; s.returning = false; s.ready = false; }
+    for (const s of this.slots) { s.voteMapId = ''; s.returning = false; s.ready = s.type === SlotType.Bot; }
+    this.rebalanceBots();
     if (this.humans().length >= this.minHumans()) this.lobbyEndTime = now() + this.cfg.lobbyTimerSeconds;
   }
 
@@ -293,7 +342,13 @@ class Room {
     for (const s of this.humans()) {
       this.race.progress[s.playerId] = { lap: 1, next: 1, passed: 0, lastTime: 0, finished: false, finishTime: -1 };
     }
-    this.broadcast({ t: 'go', serverTime: now() });
+    // Der erste Mensch lässt die Bots auf seinem Gerät fahren; der Server verteilt sie
+    const first = this.humans()[0];
+    this.race.botHost = this.bots().length && first ? first.playerId : '';
+    for (const b of this.bots()) {
+      this.race.progress[b.playerId] = { lap: 1, next: 1, passed: 0, lastTime: 0, finished: false, finishTime: -1 };
+    }
+    this.broadcast({ t: 'go', serverTime: now(), botHost: this.race.botHost });
     log(`Raum ${this.code}: Rennen wird geladen (${this.humans().length} Spieler, Karte ${this.chosenMapId})`);
   }
 
@@ -341,7 +396,7 @@ class Room {
         p.finished = true;
         p.finishTime = t;
         this.race.finished.add(playerId);
-        if (this.finishDeadline === 0) this.finishDeadline = now() + this.cfg.finishTimeoutSeconds;
+        if (!playerId.startsWith(BOT_PREFIX) && this.finishDeadline === 0) this.finishDeadline = now() + this.cfg.finishTimeoutSeconds;
         this.broadcastStandings();
       }
     } else {
@@ -367,7 +422,7 @@ class Room {
     if (!this.race) return;
     const list = this.rankList();
     const places = new Array(SLOT_COUNT).fill(0);   // Platz je Sitz (0 = nicht im Rennen)
-    list.forEach((p, i) => { const s = this.slotOf(p.id); if (s) places[s.index] = i + 1; });
+    list.forEach((p, i) => { const s = this.slotById(p.id); if (s) places[s.index] = i + 1; });
     this.broadcast({ t: 'ranks', places });
   }
 
@@ -387,7 +442,7 @@ class Room {
   }
 
   // Eine Ergebniszeile; final=false: wer noch fährt, bekommt "fährt noch"
-  makeRow(playerId, name, car, p, sent, final) {
+  makeRow(playerId, name, car, p, sent, final, isBot = false) {
     const finished = !!(p && p.finished);
     let total = -1;
     if (finished) {
@@ -395,7 +450,7 @@ class Room {
       total = sent && sent.totalTime > 0 && Math.abs(sent.totalTime - p.finishTime) < 3 ? sent.totalTime : p.finishTime;
     }
     return {
-      place: 0, playerId, playerName: name, isLocal: false, isBot: false, car,
+      place: 0, playerId, playerName: name, isLocal: false, isBot, car,
       carDisplayName: sent ? sent.carDisplayName : '', totalTime: total, bestLap: sent ? sent.bestLap : -1,
       newPersonalBest: false, coinsEarned: 0, coinsCollected: sent ? Math.max(0, Math.min(sent.coinsCollected | 0, 99)) : 0,
       didNotFinish: !finished, stillDriving: !finished && !final
@@ -407,8 +462,10 @@ class Room {
     const trial = this.modeId === 'time_trial';
     rows.forEach((r, i) => {
       r.place = r.didNotFinish ? 0 : i + 1;
-      const placeReward = trial || r.didNotFinish ? 0 : this.cfg.coinsByPlace[Math.min(i, this.cfg.coinsByPlace.length - 1)] || 0;
-      r.coinsEarned = r.didNotFinish || trial ? 0 : placeReward + r.coinsCollected;
+      // Krone: Platz 1 gegen mindestens einen Gegner (Bots zählen als Gegner), nie im Zeitfahren; dazu die eingesammelten Münzen
+      const crownAllowed = this.isPublic || rows.filter((x) => !x.isBot).length >= this.cfg.privateCrownMinHumans;
+      r.crown = !trial && crownAllowed && i === 0 && rows.length > 1 && !r.didNotFinish && !r.isBot;
+      r.coinsEarned = r.didNotFinish || r.isBot ? 0 : (r.crown ? this.cfg.crownCoins : 0) + r.coinsCollected;
     });
     return rows;
   }
@@ -420,6 +477,7 @@ class Room {
       present.add(s.playerId);
       rows.push(this.makeRow(s.playerId, s.displayName, s.car, this.race.progress[s.playerId], this.results.get(s.playerId), final));
     }
+    for (const b of this.bots()) rows.push(this.makeRow(b.playerId, b.displayName, b.car, this.race.progress[b.playerId], null, final, true));
     // Wer schon im Ziel war und die Lobby verlassen hat, bleibt in der Liste
     for (const [id, row] of this.leftFinished) if (!present.has(id)) rows.push({ ...row });
     return this.rankRows(rows);
@@ -494,6 +552,7 @@ function sanitizeCar(car) {
   return {
     carId: s(car.carId, ''), paintId: s(car.paintId, 'blue'), patternId: s(car.patternId, 'none'),
     materialId: s(car.materialId, 'lacquer'), hornId: s(car.hornId, 'horn_2'),
+    teacherId: s(car.teacherId, 'teacher_1'), teacherSkinId: s(car.teacherSkinId, ''),
     stickers: Array.isArray(car.stickers) ? [0, 1, 2, 3].map((i) => s(car.stickers[i], '')) : ['', '', '', '']
   };
 }
@@ -551,6 +610,7 @@ const handlers = {
     const room = new Room(code, false, settings, client.cfg, m.maps);
     room.hostPlayerId = client.playerId;
     rooms.set(code, room);
+    room.setBotPool(m.botPool);
     room.addHuman(client, sanitizeCar(m.car));
     // Zeitfahren: allein, Timer läuft sofort (mit "Bereit" geht es schneller los)
     if (room.modeId === 'time_trial') room.lobbyEndTime = now() + client.cfg.lobbyTimerSeconds;
@@ -565,8 +625,10 @@ const handlers = {
     open.sort((a, b) => b.humans().length - a.humans().length);
     let room = open[0];
     if (!room) {
-      room = new Room(randomCode(), true, { laps: client.cfg.publicLaps, maxPlayers: SLOT_COUNT }, client.cfg, m.maps);
+      const level = Math.max(0, Math.min(3, m.botLevel | 0));
+      room = new Room(randomCode(), true, { laps: client.cfg.publicLaps, maxPlayers: SLOT_COUNT, botLevel: level }, client.cfg, m.maps);
       rooms.set(room.code, room);
+      room.setBotPool(m.botPool);
     }
     joinRoom(client, room, m.car, m.id);
   },
@@ -649,6 +711,18 @@ const handlers = {
 
   bots(client, m) { client.ack(m.id, true); },
 
+  botlevel(client, m) {
+    const room = hostOnly(client, m.id);
+    if (!room) return;
+    if (room.phase !== Phase.Waiting) return client.ack(m.id, false, Err.TooLate, '');
+    room.botLevel = Math.max(0, Math.min(3, m.level | 0));
+    room.botsEnabled = room.botLevel > 0;
+    room.setBotPool(m.botPool);
+    room.rebalanceBots();
+    client.ack(m.id, true);
+    room.broadcastLobby();
+  },
+
   mode(client, m) {
     const room = hostOnly(client, m.id);
     if (!room) return;
@@ -671,6 +745,24 @@ const handlers = {
     const room = client.room;
     if (!room) return;
     room.onMapLoaded(client.playerId, m.highest | 0);
+  },
+
+  // Bot-Auto-Daten vom Bot-Gastgeber: an die anderen weiterleiten (wie ein Spieler-Auto)
+  bs(client, m) {
+    const room = client.room;
+    if (!room || room.phase !== Phase.InRace || !room.race || room.race.botHost !== client.playerId) return;
+    const slot = room.slots[m.i | 0];
+    if (!slot || slot.type !== SlotType.Bot || !Array.isArray(m.a) || m.a.length < 10) return;
+    room.broadcast({ t: 's', i: slot.index, a: m.a.slice(0, 12) }, client.playerId);
+  },
+
+  // Checkpoint eines Bots (vom Bot-Gastgeber gemeldet)
+  bcp(client, m) {
+    const room = client.room;
+    if (!room || room.phase !== Phase.InRace || !room.race || room.race.botHost !== client.playerId) return;
+    const slot = room.slots[m.slot | 0];
+    if (!slot || slot.type !== SlotType.Bot) return;
+    room.onCheckpoint(slot.playerId, m.idx | 0);
   },
 
   race_ready(client, m) {
@@ -780,6 +872,3 @@ process.on('SIGTERM', () => {
   for (const client of wss.clients) client.close(1001, 'Server startet neu');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
-});
-
-
