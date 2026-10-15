@@ -80,7 +80,7 @@ class Room {
   emptySlot(index, locked) {
     return {
       index, type: locked ? SlotType.Locked : SlotType.Empty, playerId: '', displayName: '', ready: false,
-      connected: true, returning: false, car: { carId: '', paintId: 'blue', patternId: 'none', materialId: 'lacquer', hornId: 'horn_2', teacherId: 'teacher_1', teacherSkinId: '', stickers: ['', '', '', ''] },
+      connected: true, returning: false, car: { carId: '', paintId: 'blue', patternId: 'none', materialId: 'lacquer', hornId: 'horn_2', teacherId: 'teacher_1', teacherSkinId: '', stickers: ['', '', '', ''], animationMask: 0 },
       voteMapId: ''
     };
   }
@@ -553,7 +553,8 @@ function sanitizeCar(car) {
     carId: s(car.carId, ''), paintId: s(car.paintId, 'blue'), patternId: s(car.patternId, 'none'),
     materialId: s(car.materialId, 'lacquer'), hornId: s(car.hornId, 'horn_2'),
     teacherId: s(car.teacherId, 'teacher_1'), teacherSkinId: s(car.teacherSkinId, ''),
-    stickers: Array.isArray(car.stickers) ? [0, 1, 2, 3].map((i) => s(car.stickers[i], '')) : ['', '', '', '']
+    stickers: Array.isArray(car.stickers) ? [0, 1, 2, 3].map((i) => s(car.stickers[i], '')) : ['', '', '', ''],
+    animationMask: Number.isInteger(car.animationMask) ? (car.animationMask & 7) : 0
   };
 }
 
@@ -872,3 +873,4 @@ process.on('SIGTERM', () => {
   for (const client of wss.clients) client.close(1001, 'Server startet neu');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
+});
