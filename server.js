@@ -22,8 +22,11 @@ const DEFAULTS = {
   lobbyTimerSeconds: 60, autoStartMinHumans: 3, publicAutoStartMinHumans: 2, lateJoinMinSeconds: 10,
   countdownSeconds: 5, raceLoadTimeoutSeconds: 30, resultsReturnSeconds: 10, finishTimeoutSeconds: 30,
   kickBanSeconds: 300, publicLaps: 3, crownCoins: 10, privateCrownMinHumans: 3,
-  maxStateRate: 30, raceCountdownSeconds: 3, sceneReadyTimeoutSeconds: 25
+  maxStateRate: 30, raceCountdownSeconds: 3, sceneReadyTimeoutSeconds: 25,
+  itemBoxRespawnSeconds: 7
 };
+
+const MAX_ITEM_BOXES = 64;
 
 const now = () => Date.now() / 1000;
 const rooms = new Map();      // code -> Room
@@ -47,7 +50,7 @@ function isValidCode(code) {
 
 // ====================================================================== Raum
 class Room {
-  constructor(code, isPublic, settings, cfg, maps) {
+  constructor(code, isPublic, settings, cfg, maps, mapLaps) {
     this.code = code;
     this.isPublic = isPublic;
     this.cfg = cfg;
@@ -55,7 +58,10 @@ class Room {
     this.hostPlayerId = '';
     this.modeId = settings.modeId || 'race';
     this.maxPlayers = Math.max(2, Math.min(SLOT_COUNT, settings.maxPlayers || SLOT_COUNT));
-    this.laps = Math.max(1, Math.min(5, settings.laps || 3));
+    this.laps = Math.max(1, Math.min(5, settings.laps || 2));   // wird nach der Kartenwahl auf die Runden der Map gesetzt
+    this.mapLaps = mapLaps && typeof mapLaps === 'object' ? mapLaps : {};   // Runden je Map (kommen aus den Map-Daten des Spiels)
+    this.mapCount = Math.max(1, Math.min(3, settings.mapCount | 0 || 1));   // wie viele Maps hintereinander gefahren werden
+    this.seriesIndex = 0;                                                  // wie viele davon schon gefahren sind
     this.botLevel = Math.max(0, Math.min(3, settings.botLevel | 0));   // 0 aus, 1 leicht, 2 schwer, 3 ultra (Bots selbst kommen online später)
     this.botsEnabled = this.botLevel > 0;
     this.botPool = [];   // Namen und Autos für die Bots (schickt das Spiel)
@@ -202,6 +208,8 @@ class Room {
       modeId: this.modeId,
       maxPlayers: this.maxPlayers,
       laps: this.laps,
+      mapCount: this.mapCount,
+      seriesIndex: this.seriesIndex,
       botsEnabled: this.botsEnabled,
       botLevel: this.botLevel,
       phase: this.phase,
@@ -257,10 +265,13 @@ class Room {
     const top = [...counts.entries()].filter(([, c]) => c === best).map(([m]) => m);
     const pool = top.length ? top : this.maps;
     this.chosenMapId = pool.length ? pool[Math.floor(Math.random() * pool.length)] : '';
-    log(`Raum ${this.code}: Karte '${this.chosenMapId}' (${votes.length} Stimmen)`);
+    const mapLaps = this.mapLaps[this.chosenMapId] | 0;
+    if (mapLaps > 0) this.laps = Math.max(1, Math.min(5, mapLaps));
+    log(`Raum ${this.code}: Karte '${this.chosenMapId}' (${votes.length} Stimmen, ${this.laps} Runden)`);
   }
 
   backToWaiting() {
+    if (this.seriesIndex >= this.mapCount) this.seriesIndex = 0;   // Serie zu Ende: nächste Runde der Lobby beginnt neu
     this.phase = Phase.Waiting;
     this.chosenMapId = '';
     this.lobbyEndTime = 0;
@@ -339,6 +350,7 @@ class Room {
     this.race.started = false;
     this.race.sceneReady = new Set();
     this.race.goTime = now();
+    this.race.boxes = new Map();   // Itembox-Nummer -> Zeit, ab der sie wieder da ist
     for (const s of this.humans()) {
       this.race.progress[s.playerId] = { lap: 1, next: 1, passed: 0, lastTime: 0, finished: false, finishTime: -1 };
     }
@@ -502,6 +514,7 @@ class Room {
     if (this.phase !== Phase.InRace) return;
     const t = now();
     this.phase = Phase.Results;
+    this.seriesIndex += 1;
     this.resultsEndTime = t + this.cfg.resultsReturnSeconds;
     for (const s of this.humans()) s.returning = true;
     this.sendResults('final', true);
@@ -608,13 +621,12 @@ const handlers = {
     let code = isValidCode(settings.reservedCode) && !rooms.has(settings.reservedCode) ? settings.reservedCode : randomCode();
     if (!code) return client.ack(m.id, false, Err.Unknown, '');
     reserved.delete(code);
-    const room = new Room(code, false, settings, client.cfg, m.maps);
+    const room = new Room(code, false, settings, client.cfg, m.maps, m.mapLaps);
     room.hostPlayerId = client.playerId;
     rooms.set(code, room);
     room.setBotPool(m.botPool);
     room.addHuman(client, sanitizeCar(m.car));
-    // Zeitfahren: allein, Timer läuft sofort (mit "Bereit" geht es schneller los)
-    if (room.modeId === 'time_trial') room.lobbyEndTime = now() + client.cfg.lobbyTimerSeconds;
+    // Zeitrennen: allein, kein Timer – gestartet wird mit "Los geht's!" (Bereit) in der eigenen Lobby
     room.broadcastLobby();
     client.ack(m.id, true);
     log(`Raum ${code} erstellt von ${client.name} (${room.modeId})`);
@@ -627,7 +639,7 @@ const handlers = {
     let room = open[0];
     if (!room) {
       const level = Math.max(0, Math.min(3, m.botLevel | 0));
-      room = new Room(randomCode(), true, { laps: client.cfg.publicLaps, maxPlayers: SLOT_COUNT, botLevel: level }, client.cfg, m.maps);
+      room = new Room(randomCode(), true, { laps: client.cfg.publicLaps, maxPlayers: SLOT_COUNT, botLevel: level }, client.cfg, m.maps, m.mapLaps);
       rooms.set(room.code, room);
       room.setBotPool(m.botPool);
     }
@@ -701,11 +713,12 @@ const handlers = {
     client.ack(m.id, true);
   },
 
-  laps(client, m) {
+  mapcount(client, m) {
     const room = hostOnly(client, m.id);
     if (!room) return;
     if (room.phase !== Phase.Waiting) return client.ack(m.id, false, Err.TooLate, '');
-    room.laps = Math.max(1, Math.min(5, m.laps | 0));
+    if (room.seriesIndex > 0) return client.ack(m.id, false, Err.TooLate, '');   // mitten in der Serie bleibt die Anzahl
+    room.mapCount = Math.max(1, Math.min(3, m.count | 0 || 1));
     client.ack(m.id, true);
     room.broadcastLobby();
   },
@@ -797,6 +810,29 @@ const handlers = {
     room.broadcast({ t: 'fx', i: slot.index, k: String(m.k || '').slice(0, 20), v: Number(m.v) || 0 }, client.playerId);
   },
 
+  // Itembox: wer zuerst kommt, bekommt sie; sie ist dann für alle weg und kommt nach itemBoxRespawnSeconds wieder (nie im Zeitfahren)
+  box(client, m) {
+    const room = client.room;
+    const slot = room && room.slotOf(client.playerId);
+    if (!slot || room.phase !== Phase.InRace || !room.race || !room.race.boxes || room.modeId === 'time_trial') return;
+    const index = m.b | 0;
+    if (index < 0 || index >= MAX_ITEM_BOXES) return;
+    const t = now();
+    if ((room.race.boxes.get(index) || 0) > t) return;   // schon weg: ein anderer war schneller
+    const until = t + Math.max(1, Number(room.cfg.itemBoxRespawnSeconds) || DEFAULTS.itemBoxRespawnSeconds);
+    room.race.boxes.set(index, until);
+    room.broadcast({ t: 'box', b: index, i: slot.index, until });
+  },
+
+  // Angriffs-Item (Papierflieger, Schulglocke): Start an die anderen weiterleiten; jedes Gerät rechnet Flug und Treffer selbst nach
+  ie(client, m) {
+    const room = client.room;
+    const slot = room && room.slotOf(client.playerId);
+    if (!slot || room.phase !== Phase.InRace || room.modeId === 'time_trial') return;
+    const v3 = (a) => (Array.isArray(a) && a.length >= 3 ? a.slice(0, 3).map((x) => Number(x) || 0) : [0, 0, 0]);
+    room.broadcast({ t: 'ie', i: slot.index, k: String(m.k || '').slice(0, 12), p: v3(m.p), d: v3(m.d) }, client.playerId);
+  },
+
   results(client, m) {
     const room = client.room;
     if (!room) return;
@@ -874,3 +910,4 @@ process.on('SIGTERM', () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 });
+
