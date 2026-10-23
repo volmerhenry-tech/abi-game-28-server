@@ -5,12 +5,14 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_client.js"
+    "test": "node test_client.js",
+    "test:classes": "node test_classes.js"
   },
   "license": "UNLICENSED",
   "private": true,
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "firebase-admin": "^12.7.0"
   },
   "engines": {
     "node": ">=20"

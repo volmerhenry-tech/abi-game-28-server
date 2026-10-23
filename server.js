@@ -6,6 +6,36 @@
 
 const http = require('http');
 const WebSocket = require('ws');
+const Classes = require('./classes');
+
+// Klassen und Schulziel: mit Dienstkonto in Firestore (Render: Umgebungsvariable FIREBASE_SERVICE_ACCOUNT), sonst im Arbeitsspeicher (lokal)
+let firebaseAdmin = null;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    firebaseAdmin = require('firebase-admin');
+    firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)) });
+  } catch (error) {
+    console.error('Firebase-Dienstkonto konnte nicht geladen werden – Klassen laufen im Arbeitsspeicher:', error.message);
+    firebaseAdmin = null;
+  }
+}
+const dataStore = firebaseAdmin ? new Classes.FirestoreStore(firebaseAdmin) : new Classes.MemoryStore();
+const classService = new Classes.ClassService(dataStore);
+const Minigames = require('./minigames');
+const minigameService = new Minigames.MinigameService(dataStore);
+
+/** Prüft ein Firebase-ID-Token und liefert die Nutzer-Kennung (uid). Ohne Firebase (lokal) gilt die mitgeschickte Test-Kennung. */
+async function verifyUser(idToken, devUid) {
+  if (firebaseAdmin) {
+    if (!idToken) return '';
+    try {
+      const token = await firebaseAdmin.auth().verifyIdToken(String(idToken));
+      // Gast-Konten (anonym) sind in Klassen nicht dabei
+      return token.firebase && token.firebase.sign_in_provider === 'anonymous' ? '' : token.uid;
+    } catch { return ''; }
+  }
+  return String(devUid || '').slice(0, 64);
+}
 
 const PORT = Number(process.env.PORT) || 8787;
 const SLOT_COUNT = 10;
@@ -520,6 +550,18 @@ class Room {
     this.sendResults('final', true);
     this.broadcastLobby();
     log(`Raum ${this.code}: Ergebnis an ${this.clients.size} Spieler`);
+    this.creditClasses();
+  }
+
+  // Klassen und Schulziel: jeder Mensch, der ins Ziel kam, zählt (nie im Zeitrennen)
+  creditClasses() {
+    if (this.modeId === 'time_trial' || !this.race) return;
+    const uids = this.humans()
+      .filter((s) => this.race.progress[s.playerId] && this.race.progress[s.playerId].finished)
+      .map((s) => (this.clients.get(s.playerId) || {}).uid)
+      .filter(Boolean);
+    if (uids.length === 0) return;
+    classService.creditRace(uids).catch((error) => log('Klassen-Wertung fehlgeschlagen:', error.message));
   }
 }
 
@@ -567,7 +609,11 @@ function sanitizeCar(car) {
     materialId: s(car.materialId, 'lacquer'), hornId: s(car.hornId, 'horn_2'),
     teacherId: s(car.teacherId, 'teacher_1'), teacherSkinId: s(car.teacherSkinId, ''),
     stickers: Array.isArray(car.stickers) ? [0, 1, 2, 3].map((i) => s(car.stickers[i], '')) : ['', '', '', ''],
-    animationMask: Number.isInteger(car.animationMask) ? (car.animationMask & 7) : 0
+    animationMask: Number.isInteger(car.animationMask) ? (car.animationMask & 7) : 0,
+    // Namenskarte (Titel, Banner, Emblem, Level): nur Kennungen und kleine Zahlen, der Text kommt aus dem Spiel
+    titleId: s(car.titleId, ''), bannerId: s(car.bannerId, ''),
+    avatarId: Number.isInteger(car.avatarId) ? Math.max(0, Math.min(63, car.avatarId)) : 0,
+    level: Number.isInteger(car.level) ? Math.max(0, Math.min(999, car.level)) : 0
   };
 }
 
@@ -603,6 +649,8 @@ const handlers = {
     }
     client.send({ t: 'hello', serverTime: now(), playerId: client.playerId });
     client.ack(m.id, true);
+    // Klassen zählen nur mit geprüfter Kennung (Firebase-Token); lokal ohne Firebase gilt die Spieler-Kennung
+    verifyUser(m.idToken, client.playerId).then((uid) => { client.uid = uid; }).catch(() => { client.uid = ''; });
   },
 
   reserve(client, m) {
@@ -854,10 +902,77 @@ const handlers = {
 };
 
 // ====================================================================== Start
+// Klassen-Seite: POST /api/class mit JSON {op, idToken, name, ...}. Als text/plain geschickt, damit der Browser keine Vorab-Anfrage braucht.
+const API_LIMIT_PER_MINUTE = 40;
+const apiHits = new Map();
+const classOps = {
+  state: (uid) => classService.state(uid),
+  join: (uid, b) => classService.join(uid, b.name, String(b.classId || '').slice(0, 40)),
+  leave: (uid) => classService.leave(uid),
+  create: (uid, b) => classService.create(uid, b.name, b.clubName),
+  vote: (uid, b) => classService.voteKick(uid, String(b.targetUid || '').slice(0, 64)),
+  claim: (uid, b) => classService.claim(uid, b.what === 'school' ? 'school' : 'class')
+};
+
+// Minigames: POST /api/minigame mit {op: start|submit|top, game, ...}; der Server prüft Läufe und rechnet Münzen
+const minigameOps = {
+  start: (uid, b) => minigameService.start(uid, String(b.game || '')),
+  submit: async (uid, b) => {
+    const member = await dataStore.get('classMembers', uid);
+    return minigameService.submit(uid, b.name, member ? member.classId : '', b.runId, b.score, b.seconds);
+  },
+  top: (uid, b) => minigameService.top(uid, String(b.game || ''), b.scope === 'class' ? 'class' : b.scope === 'personal' ? 'personal' : 'school')
+};
+
+function handleClassApi(req, res, ops = classOps) {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const minute = Math.floor(Date.now() / 60000);
+  const hit = apiHits.get(ip);
+  const count = hit && hit.minute === minute ? hit.count + 1 : 1;
+  apiHits.set(ip, { minute, count });
+  const reply = (status, body) => {
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify(body));
+  };
+  if (count > API_LIMIT_PER_MINUTE) return reply(429, { ok: false, code: 'TooMany', message: 'Zu viele Anfragen – kurz warten.' });
+  let raw = '';
+  req.on('data', (chunk) => { raw += chunk; if (raw.length > 4096) req.destroy(); });
+  req.on('end', async () => {
+    let body;
+    try { body = JSON.parse(raw); } catch { return reply(400, { ok: false, code: 'Bad', message: '' }); }
+    const op = ops[body && body.op];
+    if (!op) return reply(400, { ok: false, code: 'Bad', message: '' });
+    const uid = await verifyUser(body.idToken, body.devUid);
+    if (!uid) return reply(401, { ok: false, code: 'NotSignedIn', message: 'Bitte melde dich an (kein Gast-Konto).' });
+    try {
+      reply(200, await op(uid, body));
+    } catch (error) {
+      log('Klassen-Fehler', body.op, error.message);
+      reply(500, { ok: false, code: 'Unknown', message: 'Gerade nicht erreichbar.' });
+    }
+  });
+}
+
+setInterval(() => { const minute = Math.floor(Date.now() / 60000); for (const [ip, hit] of apiHits) if (hit.minute < minute) apiHits.delete(ip); }, 60000).unref();
+
 const server = http.createServer((req, res) => {
+  if (req.url === '/api/class') {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+      return res.end();
+    }
+    if (req.method === 'POST') return handleClassApi(req, res);
+  }
+  if (req.url === '/api/minigame') {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Content-Type' });
+      return res.end();
+    }
+    if (req.method === 'POST') return handleClassApi(req, res, minigameOps);
+  }
   // Weck-Anfrage des Spiels: einfach "ok" zurückgeben
   res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
-  res.end(`Abi Game 28 Server ok, Räume: ${rooms.size}`);
+  res.end(`Abi Game 28 Server ok, Räume: ${rooms.size}, Klassen: ${firebaseAdmin ? 'Firestore' : 'Arbeitsspeicher'}`);
 });
 const wss = new WebSocket.Server({ server, maxPayload: 16 * 1024 });
 
@@ -910,4 +1025,3 @@ process.on('SIGTERM', () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 5000).unref();
 });
-
