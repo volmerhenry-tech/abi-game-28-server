@@ -65,6 +65,14 @@ async function main() {
   r = await svc.join('f', 'Spieler f', club);
   assert.strictEqual(r.code, 'NotAllowed', 'Rausgewählt: 7 Tage gesperrt');
   assert.ok((await svc.join('f', 'Spieler f', 'p_9c')).ok, 'darf sofort woanders hin');
+  // Schulklasse: Rauswurf ohne Sperre (nur Clubs sperren 7 Tage)
+  for (const u of ['g', 'h', 'i']) assert.ok((await svc.join(u, 'Spieler ' + u, 'p_9c')).ok);
+  await svc.creditRace(['g', 'h', 'i']);
+  assert.ok((await svc.voteKick('g', 'f')).ok);
+  assert.ok((await svc.voteKick('h', 'f')).ok);
+  r = await svc.voteKick('i', 'f');
+  assert.ok(r.ok && r.kicked, 'aus der Schulklasse rausgewählt');
+  assert.ok((await svc.join('f', 'Spieler f', 'p_9c')).ok, 'Schulklasse: keine 7-Tage-Sperre');
 
   // Wochenziel schaffen → Klassenbox nur für Mitfahrer, einmal
   for (let i = 0; i < 9; i++) await svc.creditRace(['b', 'c', 'd']);

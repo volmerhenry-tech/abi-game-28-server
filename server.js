@@ -53,8 +53,19 @@ const DEFAULTS = {
   countdownSeconds: 5, raceLoadTimeoutSeconds: 30, resultsReturnSeconds: 10, finishTimeoutSeconds: 30,
   kickBanSeconds: 300, publicLaps: 3, crownCoins: 10, privateCrownMinHumans: 3,
   maxStateRate: 30, raceCountdownSeconds: 3, sceneReadyTimeoutSeconds: 25,
-  itemBoxRespawnSeconds: 7
+  itemBoxRespawnSeconds: 7,
+  publicModifierChance: 0.5   // öffentliche Lobby: so oft hat ein Rennen einen Modifier (wie LobbyRules.PublicModifierChance im Spiel)
 };
+
+// Spiel-Modifier (Ids wie RaceModifiers im Spiel); öffentlich wird ohne Turbo-Wahnsinn gewürfelt
+const MODIFIERS = ['none', 'low_gravity', 'turbo', 'turbo_insane', 'darkness', 'storm', 'boost_rush'];
+const PUBLIC_MODIFIERS = ['low_gravity', 'turbo', 'darkness', 'storm', 'boost_rush'];
+const MAIN_MODE = 'race';   // Modifier gelten nur im Hauptmodus
+
+function sanitizeModifier(id) {
+  const value = String(id || 'none');
+  return MODIFIERS.includes(value) ? value : 'none';
+}
 
 const MAX_ITEM_BOXES = 64;
 
@@ -94,6 +105,7 @@ class Room {
     this.seriesIndex = 0;                                                  // wie viele davon schon gefahren sind
     this.botLevel = Math.max(0, Math.min(3, settings.botLevel | 0));   // 0 aus, 1 leicht, 2 schwer, 3 ultra (Bots selbst kommen online später)
     this.botsEnabled = this.botLevel > 0;
+    this.modifierId = isPublic ? 'none' : sanitizeModifier(settings.modifierId);
     this.botPool = [];   // Namen und Autos für die Bots (schickt das Spiel)
     this.phase = Phase.Waiting;
     this.lobbyEndTime = 0;
@@ -209,10 +221,7 @@ class Room {
 
   afterPlayerLeft(playerId) {
     if (this.phase === Phase.InRace && this.race) {
-      if (this.race.botHost === playerId) {
-        this.race.botHost = '';
-        this.broadcast({ t: 'bots_gone' });   // die Bot-Autos bleiben nicht als Hindernisse stehen
-      }
+      if (this.race.botHost === playerId) this.handOverBots();
       delete this.race.progress[playerId];
       this.tryFinishRace();
       this.broadcastStandings();
@@ -220,6 +229,26 @@ class Room {
     if (this.phase === Phase.Waiting && this.humans().length < this.minHumans() && this.lobbyEndTime > 0 && this.humans().length < 2) {
       this.lobbyEndTime = 0;
     }
+  }
+
+  /**
+   * Der Bot-Gastgeber ist gegangen: ein anderer Spieler im Rennen fährt die Bots ab ihrer letzten Stelle weiter (mit Runde und Checkpoint).
+   * Nur wenn niemand mehr im Rennen ist, verschwinden sie.
+   */
+  handOverBots() {
+    const next = this.humans().find((s) => this.race.sceneReady.has(s.playerId)) || this.humans()[0];
+    if (!next || !this.bots().length) {
+      this.race.botHost = '';
+      this.broadcast({ t: 'bots_gone' });   // die Bot-Autos bleiben nicht als Hindernisse stehen
+      return;
+    }
+    this.race.botHost = next.playerId;
+    const bots = this.bots().map((b) => {
+      const p = this.race.progress[b.playerId] || { lap: 1, passed: 0, finished: false };
+      return { i: b.index, a: (this.race.botStates || {})[b.index] || [], lap: p.lap, passed: p.passed, finished: !!p.finished };
+    });
+    this.broadcast({ t: 'bot_host', botHost: next.playerId, bots });
+    log(`Raum ${this.code}: Bots fährt jetzt ${next.playerId}`);
   }
 
   close() {
@@ -242,6 +271,7 @@ class Room {
       seriesIndex: this.seriesIndex,
       botsEnabled: this.botsEnabled,
       botLevel: this.botLevel,
+      modifierId: this.modifierId,
       phase: this.phase,
       lobbyEndTime: this.lobbyEndTime,
       countdownEndTime: this.countdownEndTime,
@@ -295,6 +325,11 @@ class Room {
     const top = [...counts.entries()].filter(([, c]) => c === best).map(([m]) => m);
     const pool = top.length ? top : this.maps;
     this.chosenMapId = pool.length ? pool[Math.floor(Math.random() * pool.length)] : '';
+    if (this.isPublic) {
+      const chance = Number(this.cfg.publicModifierChance);
+      const roll = Number.isFinite(chance) ? chance : DEFAULTS.publicModifierChance;
+      this.modifierId = Math.random() < roll ? PUBLIC_MODIFIERS[Math.floor(Math.random() * PUBLIC_MODIFIERS.length)] : 'none';
+    }
     const mapLaps = this.mapLaps[this.chosenMapId] | 0;
     if (mapLaps > 0) this.laps = Math.max(1, Math.min(5, mapLaps));
     log(`Raum ${this.code}: Karte '${this.chosenMapId}' (${votes.length} Stimmen, ${this.laps} Runden)`);
@@ -387,6 +422,7 @@ class Room {
     // Der erste Mensch lässt die Bots auf seinem Gerät fahren; der Server verteilt sie
     const first = this.humans()[0];
     this.race.botHost = this.bots().length && first ? first.playerId : '';
+    this.race.botStates = {};   // letzte Auto-Daten je Bot-Sitz (für die Übergabe, wenn der Bot-Gastgeber geht)
     for (const b of this.bots()) {
       this.race.progress[b.playerId] = { lap: 1, next: 1, passed: 0, lastTime: 0, finished: false, finishTime: -1 };
     }
@@ -794,6 +830,17 @@ const handlers = {
     room.broadcastLobby();
   },
 
+  modifier(client, m) {
+    const room = hostOnly(client, m.id);
+    if (!room) return;
+    if (room.phase !== Phase.Waiting) return client.ack(m.id, false, Err.TooLate, '');
+    const id = sanitizeModifier(m.modifierId);
+    if (id !== 'none' && room.modeId !== MAIN_MODE) return client.ack(m.id, false, Err.NotAllowed, '');
+    room.modifierId = id;
+    client.ack(m.id, true);
+    room.broadcastLobby();
+  },
+
   start_timer(client, m) {
     const room = hostOnly(client, m.id);
     if (!room) return;
@@ -815,7 +862,9 @@ const handlers = {
     if (!room || room.phase !== Phase.InRace || !room.race || room.race.botHost !== client.playerId) return;
     const slot = room.slots[m.i | 0];
     if (!slot || slot.type !== SlotType.Bot || !Array.isArray(m.a) || m.a.length < 10) return;
-    room.broadcast({ t: 's', i: slot.index, a: m.a.slice(0, 12) }, client.playerId);
+    const a = m.a.slice(0, 12);
+    if (room.race.botStates) room.race.botStates[slot.index] = a;
+    room.broadcast({ t: 's', i: slot.index, a }, client.playerId);
   },
 
   // Checkpoint eines Bots (vom Bot-Gastgeber gemeldet)

@@ -310,7 +310,8 @@ class ClassService {
       if (vote.voters.length >= kickVotesNeeded(active)) {
         delete cls.members[targetUid];
         delete cls.votes[targetUid];
-        cls.bans[targetUid] = this.clock() + KICK_BAN_DAYS * DAY;
+        // Sperre nur für Clubs (Entscheidung 25.10.2026): aus der eigenen Schulklasse Rausgewählte dürfen wieder beitreten
+        if (cls.kind === 'club') cls.bans[targetUid] = this.clock() + KICK_BAN_DAYS * DAY;
         if (cls.founderUid === targetUid) cls.founderUid = '';
         const target = docs['classMembers/' + targetUid];
         if (target) {
