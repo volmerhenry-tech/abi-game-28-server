@@ -1,14 +1,14 @@
-# Server-Update 25.10.2026 (Spielversion 0.3.1)
+# Server-Update 26.10.2026 (Spielversion 0.3.2)
 
 Geändert:
-- `classes.js`: 7-Tage-Sperre nach Rauswurf gilt nur noch für Clubs, nicht für Schulklassen (Test `test_classes.js`)
-- `server.js`: Geht der Spieler, der die Bots fährt, mitten im Rennen, übernimmt ein anderer Spieler die Bots (letzte Stelle, Runde, Checkpoint). Vorher verschwanden sie. Neuer Test `test_bot_handover.js`.
-- `server.js` (Nachtrag am Abend): Spiel-Modifier. Der Gastgeber einer privaten Lobby wählt ihn (neue Nachricht `modifier`, nur im Modus Rennen). In öffentlichen Lobbys würfelt der Server bei jeder Kartenwahl, Chance 50 %, ohne Turbo-Wahnsinn (Einstellung `publicModifierChance`). Neuer Test `test_modifier.js`. Die neuen Items Kaugummi und Strafarbeit laufen über die vorhandene Nachricht `ie`, dafür ist nichts nötig.
+- `minigames.js`: zwei neue Minigames mit eigenen Bestenlisten je Variante:
+  - Flaggenraten: `flags` (4 Antworten) und `flags_type` (selbst eintippen)
+  - Länder nennen: `countries_all`, `countries_europe`, `countries_asia`, `countries_africa`, `countries_namerica`, `countries_samerica`, `countries_oceania`, `countries_states`
+- Ohne dieses Update lehnt der Server Ergebnisse der neuen Spiele als „Unbekanntes Spiel“ ab. Dann zählen sie nur auf dem Gerät, ohne Münzen.
+- `server.js` und `classes.js` enthalten den Stand vom 25.10. (Modifier, Bot-Übergabe, Club-Sperre). Falls das Paket vom 25.10. schon oben ist, ändert sich daran nichts. Sonst kommt es hiermit mit.
 
-Das Spiel ab Version 0.3.1 versteht die Übergabe. Ältere Spielversionen bekommen die neue Nachricht, ignorieren sie aber: Dort bleiben die Bots dann stehen, statt zu verschwinden. Deshalb Server und Spiel am selben Tag hochladen.
-
-1. Im GitHub-Repo `abi-game-28-server` die Dateien ersetzen bzw. hinzufügen (Commit).
+1. Im GitHub-Repo `abi-game-28-server` die Dateien ersetzen (Commit).
 2. Render baut automatisch neu. Wenn der Deploy hängt: in Render „Manual Deploy“ → „Deploy latest commit“.
 3. Prüfen: https://abi-game-28-server.onrender.com aufrufen, es sollte wie bisher „Klassen: Firestore“ melden.
 
-Lokal geprüft: `node test_classes.js` → „alles ok“; mit laufendem Server `node test_bot_handover.js`, `node test_bots.js`, `node test_leave.js` → „Alles in Ordnung“. Nach dem Modifier-Nachtrag zusätzlich `node test_modifier.js` → „Alles OK“, `test_items.js`, `test_client.js`, `test_timeout.js` weiterhin grün.
+Lokal geprüft: `node test_minigames.js` → „alles ok“. Mit laufendem Server `node test_modifier.js` → „Alles OK“.
