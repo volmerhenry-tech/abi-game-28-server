@@ -7,7 +7,8 @@ const { weekId } = require('./classes');
 
 // Grenzen und Belohnungen je Spiel (gleiche Werte wie MinigameDefs.cs im Spiel).
 // higher: größer ist besser; minSeconds: kürzeste mögliche Dauer eines echten Laufs; maxScore: höchstens erreichbar.
-// Länder nennen: Höchstwert = alle × 1000 + Restzeit; Münzen je gefundenem Land (bei „alle 195“ weniger je Land)
+// Länder nennen: Höchstwert = alle × 1000 + Restzeit; Münzen je gefundenem Land (bei „alle 198“ weniger je Land)
+// Seit 28.10.2026: Vereinigtes Königreich aufgeteilt (England, Schottland, Wales, Nordirland) → alle 198, Europa 49
 function country(total, limitSeconds) {
   return { higher: true, minSeconds: 5, maxSeconds: limitSeconds + 30, maxScore: total * 1000 + 999, coins: (s) => Math.round(Math.floor(s / 1000) * (total > 60 ? 0.35 : 1)) };
 }
@@ -16,17 +17,22 @@ const GAMES = {
   paperplane: { higher: true, minSeconds: 6, maxSeconds: 600, maxScore: 80, coins: (s) => Math.round(s * 1.2) },
   lunchbox: { higher: true, minSeconds: 8, maxSeconds: 75, maxScore: 3000, coins: (s) => Math.round(s / 25) },
   quiz: { higher: true, minSeconds: 10, maxSeconds: 200, maxScore: 100, coins: (s) => Math.round(s / 2) },
+  // Klassenquiz und Nachmalen in drei Stufen (28.10.2026), je eigene Bestenliste
+  quiz_hard: { higher: true, minSeconds: 10, maxSeconds: 200, maxScore: 100, coins: (s) => Math.round(s / 2) },
+  quiz_ultra: { higher: true, minSeconds: 10, maxSeconds: 200, maxScore: 100, coins: (s) => Math.round(s / 2) },
   locker: { higher: false, minSeconds: 4, maxSeconds: 1800, maxScore: 10 * 1000 + 1799, coins: (s) => Math.max(5, 60 - Math.floor(s / 1000) * 5) },
   booktower: { higher: true, minSeconds: 3, maxSeconds: 900, maxScore: 200, coins: (s) => Math.round(s * 1.5) },
   paperball: { higher: true, minSeconds: 8, maxSeconds: 600, maxScore: 450, coins: (s) => Math.round(s / 6) },
   tracing: { higher: true, minSeconds: 3, maxSeconds: 75, maxScore: 110, coins: (s) => Math.round(s / 2) },
+  tracing_hard: { higher: true, minSeconds: 3, maxSeconds: 75, maxScore: 110, coins: (s) => Math.round(s / 2) },
+  tracing_ultra: { higher: true, minSeconds: 3, maxSeconds: 75, maxScore: 110, coins: (s) => Math.round(s / 2) },
   wordle: { higher: false, minSeconds: 5, maxSeconds: 3600, maxScore: 6 * 1000 + 3599, coins: (s) => Math.max(10, 70 - Math.floor(s / 1000) * 10) },
   // Flaggenraten (25.10./26.10.2026): 20 Flaggen, je 5–10 Punkte; zwei Varianten mit eigener Bestenliste
   flags: { higher: true, minSeconds: 10, maxSeconds: 20 * 12 + 60, maxScore: 200, coins: (s) => Math.round(s / 3) },
   flags_type: { higher: true, minSeconds: 10, maxSeconds: 20 * 22 + 60, maxScore: 200, coins: (s) => Math.round(s / 3) },
   // Länder nennen: gefunden × 1000 + übrige Sekunden (nur wenn alle gefunden); je Gebiet eine Bestenliste
-  countries_all: country(195, 900),
-  countries_europe: country(46, 300),
+  countries_all: country(198, 900),
+  countries_europe: country(49, 300),
   countries_asia: country(48, 300),
   countries_africa: country(54, 360),
   countries_namerica: country(23, 180),

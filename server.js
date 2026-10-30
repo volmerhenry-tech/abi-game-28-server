@@ -39,7 +39,6 @@ async function verifyUser(idToken, devUid) {
 
 const PORT = Number(process.env.PORT) || 8787;
 const SLOT_COUNT = 10;
-const BOT_RESERVE_SLOTS = 2;   // so viele Plätze bleiben für Menschen frei (wie im Spiel)
 const BOT_PREFIX = 'bot_';
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -54,6 +53,8 @@ const DEFAULTS = {
   kickBanSeconds: 300, publicLaps: 3, crownCoins: 10, privateCrownMinHumans: 3,
   maxStateRate: 30, raceCountdownSeconds: 3, sceneReadyTimeoutSeconds: 25,
   itemBoxRespawnSeconds: 7,
+  botFillTo: 6,   // Bots kommen erst beim Start dazu und füllen auf so viele Autos auf (Entscheidung User 28.10.)
+  maxBots: 7,     // so viele Bots kann ein Gerät fahren (Handy/Tablet schickt 3); alte Spielstände schicken nichts = PC
   publicModifierChance: 0.5   // öffentliche Lobby: so oft hat ein Rennen einen Modifier (wie LobbyRules.PublicModifierChance im Spiel)
 };
 
@@ -141,23 +142,25 @@ class Room {
     this.botPool = pool.slice(0, 12).map((e) => ({ name: sanitizeName(e && e.name), car: sanitizeCar(e && e.car) })).filter((e) => e.car);
   }
 
-  // Wie im Spiel: freie Plätze hinter dem letzten Menschen mit Bots füllen, zwei Plätze bleiben frei
+  // In der Wartephase gibt es keine Bots: die Plätze bleiben für Menschen frei (wie im Spiel)
   rebalanceBots() {
     if (this.phase !== Phase.Waiting) return;
-    const humans = this.humans().length;
-    const desired = this.botLevel > 0 ? Math.max(0, this.maxPlayers - BOT_RESERVE_SLOTS - humans) : 0;
-    const bots = this.bots();
-    for (let i = bots.length - 1; i >= desired; i--) Object.assign(bots[i], this.emptySlot(bots[i].index, false));
-    let lastHuman = -1;
-    this.slots.forEach((slot, i) => { if (slot.type === SlotType.Human) lastHuman = i; });
-    let count = Math.min(bots.length, desired);
-    for (let i = lastHuman + 1; i < this.maxPlayers && count < desired; i++) {
+    for (const slot of this.bots()) Object.assign(slot, this.emptySlot(slot.index, false));
+  }
+
+  // Timer abgelaufen oder alle bereit: freie Plätze mit Bots füllen, bis cfg.botFillTo Autos fahren (Bot-Stärke aus = keine Bots)
+  fillBots() {
+    const fillTo = Math.min(this.maxPlayers, Math.max(0, this.cfg.botFillTo | 0));
+    // Nicht mehr Bots, als das stärkste Gerät im Raum fahren kann (Handy/Tablet: 3), sonst stünden sie als „nicht im Ziel“ im Ergebnis
+    const capacity = Math.max(0, ...this.humans().map((s) => this.botCapacity(s.playerId)));
+    let missing = this.botLevel > 0 ? Math.min(fillTo - this.humans().length, capacity) - this.bots().length : 0;
+    for (let i = 0; i < this.maxPlayers && missing > 0; i++) {
       const slot = this.slots[i];
       if (slot.type !== SlotType.Empty) continue;
       slot.type = SlotType.Bot;
       slot.playerId = BOT_PREFIX + i;
       slot.ready = true;
-      count++;
+      missing--;
     }
     this.bots().forEach((slot, k) => {
       const entry = this.botPool.length ? this.botPool[k % this.botPool.length] : null;
@@ -165,6 +168,19 @@ class Room {
       if (entry) slot.car = entry.car;
       slot.ready = true;
     });
+  }
+
+  botCapacity(playerId) {
+    const client = this.clients.get(playerId);
+    const value = client && client.cfg ? Number(client.cfg.maxBots) : NaN;
+    return Number.isFinite(value) && value >= 0 ? value : DEFAULTS.maxBots;
+  }
+
+  // Wer die Bots fährt: das Gerät, das die meisten Bots schafft (PC vor Tablet); bei Gleichstand der Erste
+  pickBotHost(candidates) {
+    let best = null;
+    for (const s of candidates) if (!best || this.botCapacity(s.playerId) > this.botCapacity(best.playerId)) best = s;
+    return best;
   }
 
   slotById(id) {
@@ -236,7 +252,8 @@ class Room {
    * Nur wenn niemand mehr im Rennen ist, verschwinden sie.
    */
   handOverBots() {
-    const next = this.humans().find((s) => this.race.sceneReady.has(s.playerId)) || this.humans()[0];
+    const ready = this.humans().filter((s) => this.race.sceneReady.has(s.playerId));
+    const next = this.pickBotHost(ready.length ? ready : this.humans());
     if (!next || !this.bots().length) {
       this.race.botHost = '';
       this.broadcast({ t: 'bots_gone' });   // die Bot-Autos bleiben nicht als Hindernisse stehen
@@ -362,6 +379,7 @@ class Room {
       if (this.allHumansReady() || (this.lobbyEndTime > 0 && t >= this.lobbyEndTime)) {
         this.phase = Phase.Countdown;
         this.countdownEndTime = t + this.cfg.countdownSeconds;
+        this.fillBots();
         dirty = true;
       }
     } else if (this.phase === Phase.Countdown && t >= this.countdownEndTime) {
@@ -420,7 +438,7 @@ class Room {
       this.race.progress[s.playerId] = { lap: 1, next: 1, passed: 0, lastTime: 0, finished: false, finishTime: -1 };
     }
     // Der erste Mensch lässt die Bots auf seinem Gerät fahren; der Server verteilt sie
-    const first = this.humans()[0];
+    const first = this.pickBotHost(this.humans());
     this.race.botHost = this.bots().length && first ? first.playerId : '';
     this.race.botStates = {};   // letzte Auto-Daten je Bot-Sitz (für die Übergabe, wenn der Bot-Gastgeber geht)
     for (const b of this.bots()) {
