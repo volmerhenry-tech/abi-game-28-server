@@ -212,11 +212,14 @@ class ClassService {
     const school = this.rollSchool(await this.store.get('school', 'main'));
     const all = await this.store.list('classes');
     const byId = new Map(all.map((c) => [c.id, c]));
+    // Wochenpunkte je Klasse (für die Bestenliste „Klassen“, seit 30.10.2026); alte Wochen zählen 0
+    const week = weekId(this.clock());
+    const points = (c) => (c && c.week && c.week.id === week ? c.week.points | 0 : 0);
     const list = PRESETS.map((p) => {
       const c = byId.get(p.id);
-      return { id: p.id, name: p.name, kind: 'preset', grade: p.grade, memberCount: c ? Object.keys(c.members).length : 0 };
+      return { id: p.id, name: p.name, kind: 'preset', grade: p.grade, memberCount: c ? Object.keys(c.members).length : 0, weekPoints: points(c) };
     });
-    for (const c of all) if (c.kind === 'club') list.push({ id: c.id, name: c.name, kind: 'club', grade: '', memberCount: Object.keys(c.members).length });
+    for (const c of all) if (c.kind === 'club') list.push({ id: c.id, name: c.name, kind: 'club', grade: '', memberCount: Object.keys(c.members).length, weekPoints: points(c) });
     const active = Object.keys(school.active).length;
     return {
       ok: true, serverTime: this.clock(), myClass: cls ? this.publicClass(cls, uid) : null,
@@ -390,6 +393,6 @@ function cleanPlayer(name) { return String(name || '?').replace(/[^\p{L}\p{N} _.
 
 module.exports = {
   ClassService, MemoryStore, FirestoreStore,
-  racePoints, weekGoal, schoolGoal, rankIndex, kickVotesNeeded, isOffensive, cleanName, weekId, schoolPeriodId,
+  racePoints, weekGoal, schoolGoal, rankIndex, kickVotesNeeded, isOffensive, cleanName, weekId, schoolPeriodId, BLOCKED, normalizeName,
   PRESETS, MAX_MEMBERS, RANKS
 };

@@ -22,6 +22,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 const dataStore = firebaseAdmin ? new Classes.FirestoreStore(firebaseAdmin) : new Classes.MemoryStore();
 const classService = new Classes.ClassService(dataStore);
 const Minigames = require('./minigames');
+const Chat = require('./chat');
 const minigameService = new Minigames.MinigameService(dataStore);
 
 /** Prüft ein Firebase-ID-Token und liefert die Nutzer-Kennung (uid). Ohne Firebase (lokal) gilt die mitgeschickte Test-Kennung. */
@@ -59,8 +60,8 @@ const DEFAULTS = {
 };
 
 // Spiel-Modifier (Ids wie RaceModifiers im Spiel); öffentlich wird ohne Turbo-Wahnsinn gewürfelt
-const MODIFIERS = ['none', 'low_gravity', 'turbo', 'turbo_insane', 'darkness', 'storm', 'boost_rush'];
-const PUBLIC_MODIFIERS = ['low_gravity', 'turbo', 'darkness', 'storm', 'boost_rush'];
+const MODIFIERS = ['none', 'low_gravity', 'turbo', 'turbo_insane', 'darkness', 'storm', 'boost_rush', 'double_coins'];
+const PUBLIC_MODIFIERS = ['low_gravity', 'turbo', 'darkness', 'storm', 'boost_rush', 'double_coins'];
 const MAIN_MODE = 'race';   // Modifier gelten nur im Hauptmodus
 
 function sanitizeModifier(id) {
@@ -72,6 +73,8 @@ const MAX_ITEM_BOXES = 64;
 
 const now = () => Date.now() / 1000;
 const rooms = new Map();      // code -> Room
+// Verbindung kurz weg (Handy wechselt Netz, Tab im Hintergrund): in der Lobby bleibt der Platz so lange frei, bis das Spiel sich neu meldet ("resume")
+const RESUME_GRACE_MS = Number(process.env.RESUME_GRACE_MS) || 20000;
 const reserved = new Set();   // reservierte Raumcodes (Raum erstellen, Code vorab zeigen)
 let nextClientId = 1;
 
@@ -124,6 +127,7 @@ class Room {
     this.results = new Map();   // playerId -> ResultRow
     this.finishDeadline = 0;
     this.leftFinished = new Map();   // Spieler, die im Ziel waren und den Raum verlassen haben
+    this.held = new Map();           // playerId -> Zeitgeber: Verbindung weg, Platz wird freigehalten
   }
 
   emptySlot(index, locked) {
@@ -215,7 +219,47 @@ class Room {
     return target;
   }
 
+  /** Verbindung weg in der Lobby/Ergebnisliste: Platz kurz freihalten (nicht bereit, "Verbindung …"). false = sofort entfernen. */
+  holdHuman(playerId) {
+    const slot = this.slotOf(playerId);
+    if (!slot || (this.phase !== Phase.Waiting && this.phase !== Phase.Results)) return false;
+    const client = this.clients.get(playerId);
+    this.clients.delete(playerId);
+    if (client) client.room = null;
+    slot.connected = false;
+    slot.ready = false;
+    this.held.set(playerId, setTimeout(() => {
+      if (this.held.has(playerId)) this.removeHuman(playerId, 'Verbindung getrennt');
+    }, RESUME_GRACE_MS));
+    this.broadcastLobby();
+    log(`Raum ${this.code}: ${playerId} Verbindung weg, Platz bleibt ${RESUME_GRACE_MS / 1000} s frei`);
+    return true;
+  }
+
+  /** Das Spiel hat sich neu verbunden: alter Platz zurück. */
+  resumeHuman(client) {
+    const slot = this.slotOf(client.playerId);
+    if (!slot || !this.held.has(client.playerId)) return false;
+    clearTimeout(this.held.get(client.playerId));
+    this.held.delete(client.playerId);
+    slot.connected = true;
+    this.clients.set(client.playerId, client);
+    client.room = this;
+    this.broadcastLobby();
+    log(`Raum ${this.code}: ${client.playerId} wieder da`);
+    return true;
+  }
+
+  /** Vor dem Start: wer noch nicht zurück ist, verliert seinen Platz (das Rennen wartet nicht). */
+  dropHeld() {
+    for (const playerId of [...this.held.keys()]) this.removeHuman(playerId, 'Verbindung getrennt');
+  }
+
   removeHuman(playerId, reason) {
+    if (this.held.has(playerId)) {
+      clearTimeout(this.held.get(playerId));
+      this.held.delete(playerId);
+    }
     const slot = this.slotOf(playerId);
     if (slot && this.phase === Phase.InRace && this.race && this.race.progress[playerId] && this.race.progress[playerId].finished) {
       this.leftFinished.set(playerId, this.makeRow(playerId, slot.displayName, slot.car, this.race.progress[playerId], this.results.get(playerId), false));
@@ -319,7 +363,8 @@ class Room {
 
   // ---------------------------------------------------------------- Regeln
   allHumansReady() {
-    const humans = this.humans();
+    // Wer gerade neu verbindet, hält den Start nicht auf (und wird beim Start entfernt, falls er nicht zurück ist)
+    const humans = this.humans().filter((s) => s.connected !== false);
     return humans.length > 0 && humans.every((s) => s.ready);
   }
 
@@ -377,6 +422,8 @@ class Room {
     if (this.phase === Phase.Waiting) {
       // Start, sobald alle Anwesenden bereit sind (auch mit weniger Spielern als Plätzen, auch ohne laufenden Timer) oder der Timer abläuft
       if (this.allHumansReady() || (this.lobbyEndTime > 0 && t >= this.lobbyEndTime)) {
+        this.dropHeld();
+        if (this.phase === Phase.Closed) return;
         this.phase = Phase.Countdown;
         this.countdownEndTime = t + this.cfg.countdownSeconds;
         this.fillBots();
@@ -548,7 +595,7 @@ class Room {
     return {
       place: 0, playerId, playerName: name, isLocal: false, isBot, car,
       carDisplayName: sent ? sent.carDisplayName : '', totalTime: total, bestLap: sent ? sent.bestLap : -1,
-      newPersonalBest: false, coinsEarned: 0, coinsCollected: sent ? Math.max(0, Math.min(sent.coinsCollected | 0, 99)) : 0,
+      newPersonalBest: false, coinsEarned: 0, coinsCollected: sent ? Math.max(0, Math.min(sent.coinsCollected | 0, this.modifierId === 'double_coins' ? 199 : 99)) : 0,
       didNotFinish: !finished, stillDriving: !finished && !final
     };
   }
@@ -758,6 +805,14 @@ const handlers = {
     joinRoom(client, room, m.car, m.id);
   },
 
+  // Nach kurzem Verbindungsabbruch: den freigehaltenen Platz zurückholen (ohne Raumcode, auch in offenen Lobbys)
+  resume(client, m) {
+    for (const room of rooms.values()) {
+      if (room.held.has(client.playerId) && room.resumeHuman(client)) return client.ack(m.id, true);
+    }
+    client.ack(m.id, false, Err.NotFound, '');
+  },
+
   leave(client, m) {
     if (client.room) client.room.removeHuman(client.playerId, 'verlassen');
     client.ack(m.id, true);
@@ -801,7 +856,20 @@ const handlers = {
     const t = now();
     if (t - client.lastReaction < 2) return client.ack(m.id, false, Err.RateLimited, '');
     client.lastReaction = t;
-    room.broadcast({ t: 'reaction', slot: slot.index, icon: m.icon | 0, phrase: String(m.phrase || '').slice(0, 60) });
+    // Sprüche gehen durch den Chat-Filter (sonst könnte ein verändertes Spiel beliebigen Text schicken)
+    room.broadcast({ t: 'reaction', slot: slot.index, icon: m.icon | 0, phrase: Chat.clean(String(m.phrase || '').slice(0, 60)) });
+    client.ack(m.id, true);
+  },
+
+  // Chat (seit 30.10.2026): freie Nachricht, vom Server gefiltert (chat.js) und an alle im Raum geschickt, auch an den Absender
+  chat(client, m) {
+    const room = client.room;
+    const slot = room && room.slotOf(client.playerId);
+    if (!slot) return client.ack(m.id, false, Err.Gone, '');
+    if (!Chat.allow(client, now())) return client.ack(m.id, false, Err.RateLimited, '');
+    const text = Chat.clean(m.text);
+    if (!text) return client.ack(m.id, false, Err.NotAllowed, '');
+    room.broadcast({ t: 'chat', slot: slot.index, text });
     client.ack(m.id, true);
   },
 
@@ -1068,7 +1136,10 @@ wss.on('connection', (ws, req) => {
     if (!handler) return;
     try { handler(client, m); } catch (error) { log('Fehler in', m.t, error); client.ack(m.id, false, Err.Unknown, ''); }
   });
-  ws.on('close', () => { if (client.room) client.room.removeHuman(client.playerId, 'Verbindung getrennt'); });
+  ws.on('close', () => {
+    const room = client.room;
+    if (room && !room.holdHuman(client.playerId)) room.removeHuman(client.playerId, 'Verbindung getrennt');
+  });
   ws.on('error', () => {});
 });
 
